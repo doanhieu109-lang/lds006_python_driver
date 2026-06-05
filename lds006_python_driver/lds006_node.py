@@ -143,14 +143,16 @@ class LDS006DriverNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = LDS006DriverNode()
+    
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        pass
+        node.get_logger().info('Node LDS006 đang dừng bằng KeyboardInterrupt...')
     finally:
-        node.stop()
-        node.destroy_node()
-        rclpy.shutdown()
+        # Kiểm tra xem hệ thống đã shutdown chưa trước khi gọi để tránh lỗi rcl_shutdown
+        if rclpy.ok():
+            node.destroy_node()
+            rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
