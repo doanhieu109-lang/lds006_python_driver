@@ -14,10 +14,16 @@ class LDS006DriverNode(Node):
         # Khai báo Publisher cho dữ liệu LaserScan
         self.publisher_ = self.create_publisher(LaserScan, 'scan', 10)
         
-        # Các thông số cấu hình mặc định
-        self.port = '/dev/ttyUSB0'
-        self.baudrate = 115200
-        self.frame_id = 'laser_frame'
+        # Thay thế đoạn khai báo thông số cũ bằng cấu hình nhận Parameter của ROS 2
+        self.declare_parameter('port', '/dev/ttyUSB0')
+        self.declare_parameter('baudrate', 115200)
+        self.declare_parameter('frame_id', 'laser_frame')
+
+        # Đọc giá trị cấu hình (nếu terminal truyền vào cổng nào thì hệ thống sẽ lấy cổng đó)
+        self.port = self.get_parameter('port').get_parameter_value().string_value
+        self.baudrate = self.get_parameter('baudrate').get_parameter_value().integer_value
+        self.frame_id = self.get_parameter('frame_id').get_parameter_value().string_value
+        
         self.min_reflectivity = 10
         
         # Khởi tạo mảng lưu trữ 360 độ (mặc định là vô cực nếu chưa có dữ liệu)
