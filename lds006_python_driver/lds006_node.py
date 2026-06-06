@@ -6,6 +6,7 @@ from sensor_msgs.msg import LaserScan
 import serial
 import math
 import threading
+import time
 
 class LDS006DriverNode(Node):
     def __init__(self):
@@ -47,10 +48,9 @@ class LDS006DriverNode(Node):
         return lb | (hb << 8)
 
     def process_lidar_packet(self, packet_values):
-        """Hàm bóc tách gói tin 22-bytes chuẩn chỉnh"""
+        """Hàm bóc tách gói tin 22-bytes đã được xác thực Checksum"""
         angle = (packet_values[1] - 0xA0) * 4
         
-        # Lọc bỏ ngay các gói tin có góc tính toán sai lệch cấu trúc
         if angle < 0 or angle >= 360:
             return
 
@@ -69,32 +69,24 @@ class LDS006DriverNode(Node):
         distance[3]     = self.get_int(packet_values[16], packet_values[17])
         reflectivity[3] = self.get_int(packet_values[18], packet_values[19])
 
-        # Tính toán kiểm tra Checksum (Tổng 20 byte đầu)
-        checksum2 = sum(packet_values[:20])
-        checksum1 = self.get_int(packet_values[20], packet_values[21])
-        
-        if checksum1 == checksum2:
-            # Khi Lidar quay về góc 0, xuất bản (publish) dữ liệu vòng quét cũ lên RViz 2
-            if angle == 0:
-                self.publish_scan()
-                # Reset mảng cho vòng quét tiếp theo
-                self.distances = [float('inf')] * 360
-                self.intensities = [0.0] * 360
-                
-            # Đổ dữ liệu 4 điểm quét chi tiết vào mảng
-            for x in range(4):
-                current_angle = angle + x
-                if current_angle < 360:
-                    if reflectivity[x] > self.min_reflectivity and 100 <= distance[x] <= 6000:
-                        # Đổi từ mm sang mét theo chuẩn hệ mét của ROS 2 LaserScan
-                        self.distances[current_angle] = float(distance[x]) / 1000.0
-                        self.intensities[current_angle] = float(reflectivity[x])
-                    else:
-                        self.distances[current_angle] = float('inf')
-                        self.intensities[current_angle] = 0.0
-        else:
-            # Tần suất cảnh báo lỗi được giới hạn (throttle) 2 giây/lần để không làm nghẽn terminal
-            self.get_logger().warn(f"Phát hiện gói dữ liệu sai checksum tại góc: {angle}", throttle_duration_sec=2.0)
+        # Khi Lidar quay về góc 0, xuất bản (publish) dữ liệu vòng quét cũ lên RViz 2
+        if angle == 0:
+            self.publish_scan()
+            # Reset mảng cho vòng quét tiếp theo
+            self.distances = [float('inf')] * 360
+            self.intensities = [0.0] * 360
+            
+        # Đổ dữ liệu 4 điểm quét chi tiết vào mảng dữ liệu ROS
+        for x in range(4):
+            current_angle = angle + x
+            if current_angle < 360:
+                if reflectivity[x] > self.min_reflectivity and 100 <= distance[x] <= 6000:
+                    # Đổi từ mm sang mét theo chuẩn hệ mét của ROS 2 LaserScan
+                    self.distances[current_angle] = float(distance[x]) / 1000.0
+                    self.intensities[current_angle] = float(reflectivity[x])
+                else:
+                    self.distances[current_angle] = float('inf')
+                    self.intensities[current_angle] = 0.0
 
     def publish_scan(self):
         """Hàm đóng gói thông điệp LaserScan lên hệ thống mạng ROS 2"""
@@ -120,40 +112,55 @@ class LDS006DriverNode(Node):
         self.publisher_.publish(scan_msg)
 
     def serial_loop(self):
-        """Vòng lặp đọc luồng dữ liệu tối ưu: Quét tìm 0xFA -> Đọc luôn khối 21-bytes"""
-        # Gửi lệnh kích hoạt Lidar phần cứng bắt đầu phát
+        """Vòng lặp đọc dữ liệu nâng cao: Sử dụng kỹ thuật Sliding Window để lọc tiêu đề nhiễu"""
+        # Gửi lệnh kích hoạt Lidar phần cứng bắt đầu phát dữ liệu
         self.ser.write(b'$')
         self.ser.write(b"startlds$")
         
-        # Giải phóng/Xóa sạch toàn bộ bộ đệm dồn ứ cũ trong phần cứng con Pi
+        # Giải phóng/Xóa sạch toàn bộ bộ đệm dồn ứ cũ tích tụ trong cổng USB
         self.ser.reset_input_buffer()
         self.get_logger().info("Đã gửi lệnh kích hoạt mô-tơ Lidar thành công. Đang xử lý luồng dữ liệu...")
 
+        buffer = bytearray()
+        
         while rclpy.ok() and self.running:
             try:
-                # 1. Quét tìm duy nhất 1 byte mở đầu có giá trị 0xFA
-                b = self.ser.read(1)
-                if not b or b[0] != 0xFA:
-                    continue
-                
-                # 2. Đọc luôn một khối 21-bytes còn lại xếp hàng phía sau
-                packet = self.ser.read(21)
-                if len(packet) < 21:
-                    continue
-                
-                # 3. Tạo mảng 22-bytes hoàn chỉnh và đẩy đi giải mã
-                packet_values = [0xFA] + list(packet)
-                self.process_lidar_packet(packet_values)
-
+                if self.ser.in_waiting > 0:
+                    # Đọc toàn bộ các byte đang xếp hàng trong luồng nhận phần cứng
+                    chunk = self.ser.read(self.ser.in_waiting)
+                    buffer.extend(chunk)
+                    
+                    # Tiến hành duyệt mảng động để bóc tách gói tin cố định 22-bytes
+                    while len(buffer) >= 22:
+                        # Bước 1: Dịch cửa sổ tìm byte tiêu đề 0xFA thực sự
+                        if buffer[0] != 0xFA:
+                            buffer.pop(0)
+                            continue
+                        
+                        # Bước 2: Trích xuất thử một cụm 22 byte để thẩm định Checksum
+                        packet = list(buffer[:22])
+                        checksum2 = sum(packet[:20])
+                        checksum1 = self.get_int(packet[20], packet[21])
+                        
+                        if checksum1 == checksum2:
+                            # Đúng cấu trúc gói tin xịn -> Đưa đi bóc tách tọa độ
+                            self.process_lidar_packet(packet)
+                            del buffer[:22]  # Xóa sạch cụm 22 byte này ra khỏi bộ đệm để sang gói tiếp theo
+                        else:
+                            # Sai Checksum -> Byte 0xFA đầu tiên chỉ là dữ liệu khoảng cách bị trùng lặp ngẫu nhiên
+                            # Chỉ xóa duy nhất 1 byte lỗi này để tịnh tiến bộ đệm tìm byte 0xFA thực sự phía sau
+                            buffer.pop(0)
+                else:
+                    time.sleep(0.001)  # Giảm tải tối đa cho CPU khi không có dữ liệu mới
             except Exception as e:
                 self.get_logger().error(f"Lỗi xảy ra trong luồng đọc Serial: {e}")
+                time.sleep(0.1)
 
     def stop(self):
         """Hàm dừng an toàn: Tắt động cơ Lidar và ngắt kết nối cổng"""
         self.running = False
         if hasattr(self, 'ser') and self.ser.is_open:
             try:
-                # Gửi lệnh lịch sự bảo Lidar dừng quay trước khi rút nguồn
                 self.ser.write(b"stoplds$")
             except:
                 pass
